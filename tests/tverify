@@ -1,0 +1,86 @@
+#!/bin/bash -e
+# Copyright (C) 2023 Simo Sorce <simo@redhat.com>
+# SPDX-License-Identifier: Apache-2.0
+
+source "${TESTSSRCDIR}/helpers.sh"
+
+ORIG_OPENSSL_CONF=${OPENSSL_CONF}
+sed "s/#pkcs11-module-allow-export/pkcs11-module-allow-export = 1/" "${OPENSSL_CONF}" > "${OPENSSL_CONF}.tverify.noexport"
+OPENSSL_CONF=${OPENSSL_CONF}.tverify.noexport
+
+title PARA "Sign and Verify when public key export is disallowed"
+
+title PARA "Sign and Verify with provided Hash and EC"
+ossl 'dgst -sha256 -binary -out ${TMPPDIR}/sha256.tverfiy.bin ${SEEDFILE}'
+ossl '
+pkeyutl -sign -inkey "${ECBASEURI}"
+              -in ${TMPPDIR}/sha256.bin
+              -out ${TMPPDIR}/sha256-ecsig.tverify.bin'
+
+ossl '
+pkeyutl -verify -inkey "${ECBASEURI}" -pubin
+                -in ${TMPPDIR}/sha256.bin
+                -sigfile ${TMPPDIR}/sha256-ecsig.tverify.bin'
+
+
+title PARA "DigestSign and DigestVerify with ECC (SHA3-512)"
+ossl '
+pkeyutl -sign -inkey "${ECBASEURI}"
+              -digest sha3-512
+              -in ${RAND64FILE}
+              -rawin
+              -out ${TMPPDIR}/sha3-512-ecdgstsig.tverify.bin'
+
+ossl '
+pkeyutl -verify -inkey "${ECBASEURI}" -pubin
+                -digest sha3-512
+                -in ${RAND64FILE}
+                -rawin
+                -sigfile ${TMPPDIR}/sha3-512-ecdgstsig.tverify.bin'
+
+title PARA "Sign and Verify with provided Hash and RSA"
+ossl 'dgst -sha256 -binary -out ${TMPPDIR}/sha256.tverify.bin ${SEEDFILE}'
+ossl '
+pkeyutl -sign -inkey "${PRIURI}"
+              -in ${TMPPDIR}/sha256.bin
+              -out ${TMPPDIR}/sha256-sig.tverify.bin'
+
+ossl '
+pkeyutl -verify -inkey "${PUBURI}"
+                -pubin
+                -in ${TMPPDIR}/sha256.bin
+                -sigfile ${TMPPDIR}/sha256-sig.tverify.bin'
+
+
+title PARA "Test Sign and Verify with ED25519"
+ossl '
+pkeyutl -sign -inkey "${EDBASEURI}"
+              -in ${RAND64FILE}
+              -rawin
+              -out ${TMPPDIR}/edsig.tverify.bin'
+ossl '
+pkeyutl -verify -inkey "${EDBASEURI}" -pubin
+                -in ${RAND64FILE}
+                -rawin
+                -sigfile ${TMPPDIR}/edsig.tverify.bin'
+
+# On Fedora they completely removed support for explicit EC from libcrypto,
+# so skip the test completely
+if [ -f /etc/fedora-release ]; then
+    exit 0
+fi
+
+title PARA "DigestSign and DigestVerify with ECC (SHA-256)"
+ossl '
+pkeyutl -sign -inkey "${ECXBASEURI}"
+              -digest sha256
+              -in ${RAND64FILE}
+              -rawin
+              -out ${TMPPDIR}/sha256-ecdgstsig.tverify.bin'
+ossl '
+pkeyutl -verify -inkey "${ECXBASEURI}" -pubin
+                -digest sha256
+                -in ${RAND64FILE}
+                -rawin
+                -sigfile ${TMPPDIR}/sha256-ecdgstsig.tverify.bin'
+

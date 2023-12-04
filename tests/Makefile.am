@@ -63,7 +63,7 @@ dist_check_SCRIPTS = \
 	helpers.sh setup-softhsm.sh setup-softokn.sh softhsm-proxy.sh \
 	test-wrapper tbasic tcerts tecc tecdh tedwards tdemoca thkdf \
 	toaepsha2 trsapss tdigest ttls tpubkey tfork turi trand tecxc \
-	tcms
+	tcms tverify
 
 test_LIST = \
 	basic-softokn.t basic-softhsm.t \
@@ -85,7 +85,8 @@ test_LIST = \
 	tls-softokn.t tls-softhsm.t \
 	uri-softokn.t uri-softhsm.t \
 	ecxc-softhsm.t \
-	cms-softokn.t
+	cms-softokn.t \
+	verify-softhsm.t
 
 .PHONY: $(test_LIST)
 
