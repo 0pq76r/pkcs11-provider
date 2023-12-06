@@ -1,0 +1,110 @@
+#!/bin/bash -e
+# Copyright (C) 2022 Simo Sorce <simo@redhat.com>
+# SPDX-License-Identifier: Apache-2.0
+
+source "${TESTSSRCDIR}/helpers.sh"
+
+# We need to configure early loading otherwise no digests are loaded,
+# and all checks are skipped
+sed -e "s/#pkcs11-module-encode-key-uri-to-pem/pkcs11-module-encode-key-uri-to-pem = true/" \
+    -e "s/#pkcs11-module-load-behavior/pkcs11-module-load-behavior = early/" \
+    "${OPENSSL_CONF}" > "${OPENSSL_CONF}.encode_to_pem"
+OPENSSL_CONF=${OPENSSL_CONF}.encode_to_pem
+
+make-pkey-pem() {
+    URI=$1
+    OUT=$2
+
+    RANDOM_HEX=$(od -A n -N 15 -t x1 /dev/random)
+    TMP_FILE="${TMPPDIR}/pem-encoder-${RANDOM_HEX}.cnf"
+    cat > "${TMP_FILE}" << EOF
+asn1=SEQUENCE:pk11-uri
+[pk11-uri]
+type=OID:2.5.4.83
+uri=UTF8:${URI}
+EOF
+    {
+	echo "-----BEGIN PRIVATE KEY PK11-URI-----"
+	$CHECKER openssl base64 -in <( $CHECKER openssl asn1parse -noout -out - -genconf "${TMP_FILE}" )
+	echo "-----END PRIVATE KEY PK11-URI-----"
+    }  > "${OUT}"
+    rm "${TMP_FILE}"
+}
+
+sign-verify() {
+    PRIV_KEY=$1
+    PUB_KEY=$2
+    FILE=$3
+
+    RANDOM_HEX=$(od -A n -N 15 -t x1 /dev/random)
+    TMP_FILE="${TMPPDIR}/sign-verify-pem-encoder-${RANDOM_HEX}.bin"
+
+    $CHECKER openssl pkeyutl -sign -rawin -digest sha256 \
+            -inkey "${PRIV_KEY}" \
+            -in "${FILE}" \
+            -out "${TMP_FILE}"
+
+    $CHECKER openssl pkeyutl -verify -rawin -digest sha256 \
+            -inkey "${PUB_KEY}" \
+            -pubin \
+            -in "${FILE}" \
+            -sigfile "${TMP_FILE}"
+
+    rm "${TMP_FILE}"
+}
+
+title PARA "Test PEM Encoding RSA support"
+
+make-pkey-pem "${PRIURI}" "${TMPPDIR}/priuri-pkey.pem"
+sign-verify "${TMPPDIR}/priuri-pkey.pem" "${PUBURI}" "${TMPPDIR}/64krandom.bin"
+
+RANDOM_HEX=$(od -A n -N 15 -t x1 /dev/random)
+export LABEL_SUFFIX_URI=${RANDOM_HEX// /}
+
+export ALGORITHM=rsa
+export ALGORITHM_OPT=rsa_keygen_bits:2048
+ossl '
+genpkey -propquery "provider=pkcs11"
+        -algorithm "${ALGORITHM}" -pkeyopt "${ALGORITHM_OPT}"
+        -pkeyopt "pkcs11_uri:pkcs11:object=Test-PEM-Encode-RSA-${LABEL_SUFFIX_URI}"
+        -out "${TMPPDIR}/rsa-pkey-uri.pem"'
+
+grep -e "-----BEGIN PRIVATE KEY PK11-URI-----" "${TMPPDIR}/rsa-pkey-uri.pem"
+
+sign-verify "${TMPPDIR}/rsa-pkey-uri.pem" \
+            "pkcs11:object=Test-PEM-Encode-RSA-${LABEL_SUFFIX_URI}" \
+            "${TMPPDIR}/64krandom.bin"
+
+
+title PARA "Test PEM Encoding EC support"
+
+make-pkey-pem "${ECPRIURI}" "${TMPPDIR}/ecpriuri-pkey.pem"
+sign-verify "${TMPPDIR}/ecpriuri-pkey.pem" "${ECPUBURI}" "${TMPPDIR}/64krandom.bin"
+
+export ALGORITHM=EC
+export ALGORITHM_OPT=ec_paramgen_curve:prime256v1
+ossl '
+genpkey -propquery "provider=pkcs11"
+        -algorithm "${ALGORITHM}" -pkeyopt "${ALGORITHM_OPT}"
+        -pkeyopt "pkcs11_uri:pkcs11:object=Test-PEM-Encode-EC-${LABEL_SUFFIX_URI}"
+        -out "${TMPPDIR}/ec-pkey-uri.pem"'
+
+grep -e "-----BEGIN PRIVATE KEY PK11-URI-----" "${TMPPDIR}/ec-pkey-uri.pem"
+
+sign-verify "${TMPPDIR}/ec-pkey-uri.pem" \
+            "pkcs11:object=Test-PEM-Encode-EC-${LABEL_SUFFIX_URI}" \
+            "${TMPPDIR}/64krandom.bin"
+
+
+title PARA "Test ambiguous key is unusable"
+
+make-pkey-pem "${BASEURI}" "${TMPPDIR}/priuri-pkey.pem"
+FAIL=0
+ossl '
+pkey -in "${TMPPDIR}/priuri-pkey.pem"' || FAIL=1
+if [ $FAIL -eq 0 ]; then
+    echo "Should fail because the pem references multiple and/or non-private keys"
+    exit 1
+fi
+
+exit 0
