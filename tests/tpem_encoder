@@ -15,20 +15,20 @@ make-pkey-pem() {
     URI=$1
     OUT=$2
 
-    RANDOM_HEX=$(od -A n -N 15 -t x1 /dev/random)
-    TMP_FILE="${TMPPDIR}/pem-encoder-${RANDOM_HEX}.cnf"
-    cat > "${TMP_FILE}" << EOF
-asn1=SEQUENCE:pk11-uri
-[pk11-uri]
-type=OID:2.5.4.83
-uri=UTF8:${URI}
-EOF
+    OID="06 03 55 04 53"
+    URI_HEX=$(printf '%s' "${URI}" | perl -lne 'print unpack "H*", $_')
     {
-	echo "-----BEGIN PRIVATE KEY PK11-URI-----"
-	$CHECKER openssl base64 -in <( $CHECKER openssl asn1parse -noout -out - -genconf "${TMP_FILE}" )
-	echo "-----END PRIVATE KEY PK11-URI-----"
+        echo "-----BEGIN PRIVATE KEY PK11-URI-----"
+        printf '30 82 %04x %s 0c 82 %04x %s'  \
+               "$((${#URI} + 9))" \
+               "${OID}" \
+               "${#URI}" \
+               "${URI_HEX[*]}" \
+            | tr -d ' ' \
+            | perl -lne 'print pack "H*", $_' \
+            | base64
+        echo "-----END PRIVATE KEY PK11-URI-----"
     }  > "${OUT}"
-    rm "${TMP_FILE}"
 }
 
 sign-verify() {
@@ -37,7 +37,7 @@ sign-verify() {
     FILE=$3
 
     RANDOM_HEX=$(od -A n -N 15 -t x1 /dev/random)
-    TMP_FILE="${TMPPDIR}/sign-verify-pem-encoder-${RANDOM_HEX}.bin"
+    TMP_FILE="${TMPPDIR}/sign-verify-pem-encoder-${RANDOM_HEX// /}.bin"
 
     $CHECKER openssl pkeyutl -sign -rawin -digest sha256 \
             -inkey "${PRIV_KEY}" \
@@ -98,10 +98,19 @@ sign-verify "${TMPPDIR}/ec-pkey-uri.pem" \
 
 title PARA "Test ambiguous key is unusable"
 
-make-pkey-pem "${BASEURI}" "${TMPPDIR}/priuri-pkey.pem"
+make-pkey-pem "${BASEURI}" "${TMPPDIR}/baseuri-key.pem"
 FAIL=0
 ossl '
-pkey -in "${TMPPDIR}/priuri-pkey.pem"' || FAIL=1
+pkey -in "${TMPPDIR}/baseuri-key.pem"' || FAIL=1
+if [ $FAIL -eq 0 ]; then
+    echo "Should fail because the pem references multiple and/or non-private keys"
+    exit 1
+fi
+
+make-pkey-pem "${PUBURI}" "${TMPPDIR}/puburi-key.pem"
+FAIL=0
+ossl '
+pkey -in "${TMPPDIR}/puburi-key.pem"' || FAIL=1
 if [ $FAIL -eq 0 ]; then
     echo "Should fail because the pem references multiple and/or non-private keys"
     exit 1
