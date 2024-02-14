@@ -6,12 +6,12 @@
 
 #include <openssl/asn1t.h>
 
-#define P11PROV_OID_URI "2.5.4.83" /* TODO: find a more appropriate oId */
-#define P11PROV_PK11_URI_STRUCTURE "pk11-uri"
-#define P11PROV_PRIVKEY_PEM_NAME "PRIVATE KEY PK11-URI"
+#define P11PROV_DER_STRUCTURE "pk11-uri"
+#define P11PROV_PEM_LABEL "PKCS#11 PROVIDER URI"
+#define P11PROV_DESCS_URI_FILE "PKCS#11 Provider URI v1.0"
 
 typedef struct {
-    ASN1_OBJECT *type;
+    ASN1_VISIBLESTRING *desc;
     ASN1_UTF8STRING *uri;
 } P11PROV_PK11_URI;
 

@@ -1132,13 +1132,13 @@ static const OSSL_ALGORITHM p11prov_store[] = {
 
 static const OSSL_ALGORITHM p11prov_decoders[] = {
     { "DER", "provider=pkcs11,input=pem",
-      p11prov_pem_decoder_p11_der_functions },
+      p11prov_pem_decoder_p11prov_der_functions },
     { "RSA:rsaEncryption",
-      "provider=pkcs11,input=der,structure=" P11PROV_PK11_URI_STRUCTURE,
-      p11prov_der_decoder_p11_rsa_functions },
+      "provider=pkcs11,input=der,structure=" P11PROV_DER_STRUCTURE,
+      p11prov_der_decoder_p11prov_rsa_functions },
     { "EC:id-ecPublicKey",
-      "provider=pkcs11,input=der,structure=" P11PROV_PK11_URI_STRUCTURE,
-      p11prov_der_decoder_p11_ec_functions },
+      "provider=pkcs11,input=der,structure=" P11PROV_DER_STRUCTURE,
+      p11prov_der_decoder_p11prov_ec_functions },
     { NULL, NULL, NULL }
 };
 
@@ -1326,7 +1326,7 @@ enum p11prov_cfg_enum {
     P11PROV_CFG_CACHE_KEYS,
     P11PROV_CFG_QUIRKS,
     P11PROV_CFG_CACHE_SESSIONS,
-    P11PROV_CFG_ENCODE_PK11_URI_TO_PEM,
+    P11PROV_CFG_ENCODE_PROVIDER_URI_TO_PEM,
     P11PROV_CFG_SIZE,
 };
 
@@ -1343,7 +1343,7 @@ static struct p11prov_cfg_names {
     { "pkcs11-module-cache-keys" },
     { "pkcs11-module-quirks" },
     { "pkcs11-module-cache-sessions" },
-    { "pkcs11-module-encode-key-uri-to-pem" },
+    { "pkcs11-module-encode-provider-uri-to-pem" },
 };
 
 int OSSL_provider_init(const OSSL_CORE_HANDLE *handle, const OSSL_DISPATCH *in,
@@ -1553,8 +1553,8 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle, const OSSL_DISPATCH *in,
     }
     P11PROV_debug("Cache Sessions: %d", ctx->cache_sessions);
 
-    if (cfg[P11PROV_CFG_ENCODE_PK11_URI_TO_PEM] != NULL
-        && strcmp(cfg[P11PROV_CFG_ENCODE_PK11_URI_TO_PEM], "true") == 0) {
+    if (cfg[P11PROV_CFG_ENCODE_PROVIDER_URI_TO_PEM] != NULL
+        && strcmp(cfg[P11PROV_CFG_ENCODE_PROVIDER_URI_TO_PEM], "true") == 0) {
         ctx->encode_pkey_as_pk11_uri = true;
     } else {
         ctx->encode_pkey_as_pk11_uri = false;

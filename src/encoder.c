@@ -482,7 +482,10 @@ static P11PROV_PK11_URI *p11prov_encoder_private_key_to_asn1(P11PROV_CTX *pctx,
         goto error;
     }
 
-    out->type = OBJ_txt2obj(P11PROV_OID_URI, 1);
+    if (!ASN1_STRING_set(out->desc, P11PROV_DESCS_URI_FILE,
+                         sizeof(P11PROV_DESCS_URI_FILE) - 1)) {
+        goto error;
+    }
     if (!ASN1_STRING_set(out->uri, uri, uri_len)) {
         goto error;
     }

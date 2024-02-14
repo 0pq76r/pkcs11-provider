@@ -6,6 +6,9 @@
 
 #include <openssl/core.h>
 
+#define RET_OSSL_CARRY_ON_DECODING 1
+#define RET_OSSL_STOP_DECODING 1
+
 /* DECODERs */
 #define DISPATCH_TEXT_DECODER_FN(type, name) \
     static OSSL_FUNC_DECODER_##name##_fn p11prov_##type##_DECODER_##name##_text
@@ -29,8 +32,8 @@
             (void (*)( \
                 void))p11prov_##type##_decoder_##structure##_##format##_##name \
     }
-extern const OSSL_DISPATCH p11prov_der_decoder_p11_rsa_functions[];
-extern const OSSL_DISPATCH p11prov_der_decoder_p11_ec_functions[];
-extern const OSSL_DISPATCH p11prov_pem_decoder_p11_der_functions[];
+extern const OSSL_DISPATCH p11prov_der_decoder_p11prov_rsa_functions[];
+extern const OSSL_DISPATCH p11prov_der_decoder_p11prov_ec_functions[];
+extern const OSSL_DISPATCH p11prov_pem_decoder_p11prov_der_functions[];
 
 #endif /* _DECODER_H */

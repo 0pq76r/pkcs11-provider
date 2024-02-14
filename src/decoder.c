@@ -12,7 +12,7 @@
 #include <openssl/store.h>
 #include <openssl/ui.h>
 
-#define MAX_OID_LEN 64
+#define MIN(a, b) (((a) < (b)) ? (a) : (b))
 
 typedef struct p11prov_decoder_ctx {
     P11PROV_CTX *provctx;
@@ -20,9 +20,78 @@ typedef struct p11prov_decoder_ctx {
     bool invalid;
 } P11PROV_DECODER_CTX;
 
+static int p11prov_obj_to_ossl_obj(P11PROV_OBJ *obj, OSSL_PARAM params[4])
+{
+    int object_type;
+    const char *data_type;
+    void *reference = NULL;
+    size_t reference_len;
+    CK_KEY_TYPE type;
+    CK_ATTRIBUTE *cert = NULL;
+    switch (p11prov_obj_get_class(obj)) {
+    case CKO_PUBLIC_KEY:
+    case CKO_PRIVATE_KEY:
+        object_type = OSSL_OBJECT_PKEY;
+        type = p11prov_obj_get_key_type(obj);
+        switch (type) {
+        case CKK_RSA:
+            data_type = P11PROV_NAME_RSA;
+            break;
+        case CKK_EC:
+            data_type = P11PROV_NAME_EC;
+            break;
+        case CKK_EC_EDWARDS:
+            switch (p11prov_obj_get_key_bit_size(obj)) {
+            case ED448_BIT_SIZE:
+                data_type = ED448;
+                break;
+            case ED25519_BIT_SIZE:
+                data_type = ED25519;
+                break;
+            default:
+                return RET_OSSL_ERR;
+            }
+            break;
+        default:
+            return RET_OSSL_ERR;
+        }
+        p11prov_obj_to_store_reference(obj, &reference, &reference_len);
+        if (!reference) {
+            return RET_OSSL_ERR;
+        }
+        break;
+    case CKO_CERTIFICATE:
+        object_type = OSSL_OBJECT_CERT;
+        data_type = "CERTIFICATE";
+        cert = p11prov_obj_get_attr(obj, CKA_VALUE);
+        if (!cert) {
+            return RET_OSSL_ERR;
+        }
+        break;
+    default:
+        return RET_OSSL_ERR;
+    }
+
+    params[0] = OSSL_PARAM_construct_int(OSSL_OBJECT_PARAM_TYPE, &object_type);
+    params[1] = OSSL_PARAM_construct_utf8_string(OSSL_OBJECT_PARAM_DATA_TYPE,
+                                                 (char *)data_type, 0);
+    if (reference) {
+        /* giving away the object by reference */
+        params[2] = OSSL_PARAM_construct_octet_string(
+            OSSL_OBJECT_PARAM_REFERENCE, reference, reference_len);
+    } else if (cert) {
+        params[2] = OSSL_PARAM_construct_octet_string(
+            OSSL_OBJECT_PARAM_DATA, cert->pValue, cert->ulValueLen);
+    } else {
+        return RET_OSSL_ERR;
+    }
+    params[3] = OSSL_PARAM_construct_end();
+    return RET_OSSL_OK;
+}
+
 static bool decoder_ctx_accepts_decoded_object(P11PROV_DECODER_CTX *ctx)
 {
-    return (!ctx->invalid) && (ctx->object == NULL);
+    return (!ctx->invalid) && (!ctx->object);
 }
 
 static void decoder_ctx_object_free(struct p11prov_decoder_ctx *ctx)
@@ -39,7 +108,7 @@ static void *p11prov_decoder_newctx(void *provctx)
     P11PROV_DECODER_CTX *dctx;
     cprov = provctx;
     dctx = OPENSSL_zalloc(sizeof(P11PROV_DECODER_CTX));
-    if (dctx == NULL) {
+    if (!dctx) {
         return NULL;
     }
 
@@ -61,7 +130,7 @@ static CK_RV p11prov_decoder_ctx_store_obj(void *pctx, P11PROV_OBJ *obj)
 
     if (!decoder_ctx_accepts_decoded_object(ctx)) {
         P11PROV_raise(ctx->provctx, CKR_GENERAL_ERROR,
-                      "Invalid decoder context");
+                      "decoder context does not accept any objects");
         ctx->invalid = 1;
         decoder_ctx_object_free(ctx);
         p11prov_obj_free(obj);
@@ -69,22 +138,15 @@ static CK_RV p11prov_decoder_ctx_store_obj(void *pctx, P11PROV_OBJ *obj)
     }
 
     P11PROV_debug("Adding object (handle:%lu)", p11prov_obj_get_handle(obj));
-    if (p11prov_obj_get_class(obj) != CKO_PRIVATE_KEY) {
-        P11PROV_raise(ctx->provctx, CKR_ARGUMENTS_BAD,
-                      "Object must be private key");
-        p11prov_obj_free(obj);
-        return CKR_ARGUMENTS_BAD;
-    }
-
     ctx->object = obj;
 
     return CKR_OK;
 }
 
-static CK_RV p11prov_decoder_load_pkey(P11PROV_DECODER_CTX *ctx,
-                                       const char *inuri,
-                                       OSSL_PASSPHRASE_CALLBACK *pw_cb,
-                                       void *pw_cbarg)
+static CK_RV p11prov_decoder_load_obj(P11PROV_DECODER_CTX *ctx,
+                                      const char *inuri,
+                                      OSSL_PASSPHRASE_CALLBACK *pw_cb,
+                                      void *pw_cbarg)
 {
     P11PROV_URI *parsed_uri = NULL;
     CK_RV ret = CKR_GENERAL_ERROR;
@@ -93,20 +155,19 @@ static CK_RV p11prov_decoder_load_pkey(P11PROV_DECODER_CTX *ctx,
     CK_SLOT_ID nextid = CK_UNAVAILABLE_INFORMATION;
 
     if (!decoder_ctx_accepts_decoded_object(ctx)) {
-        P11PROV_debug("Invalid context state");
-        P11PROV_raise(ctx->provctx, CKR_GENERAL_ERROR, "Invalid initial state");
+        P11PROV_debug("Invalid initial state");
         goto done;
     }
 
     parsed_uri = p11prov_parse_uri(ctx->provctx, inuri);
-    if (parsed_uri == NULL) {
-        P11PROV_raise(ctx->provctx, CKR_GENERAL_ERROR, "Failed to parse URI");
+    if (!parsed_uri) {
+        P11PROV_debug("Failed to parse URI");
         goto done;
     }
 
     ret = p11prov_ctx_status(ctx->provctx);
     if (ret != CKR_OK) {
-        P11PROV_raise(ctx->provctx, ret, "Invalid context status");
+        P11PROV_debug("Invalid context status");
         goto done;
     }
 
@@ -146,20 +207,13 @@ static CK_RV p11prov_decoder_load_pkey(P11PROV_DECODER_CTX *ctx,
 
     if (ctx->invalid) {
         ret = CKR_GENERAL_ERROR;
-        P11PROV_raise(ctx->provctx, ret, "Invalid context status");
+        P11PROV_debug("Invalid context status");
         goto done;
     }
 
     if (!ctx->object) {
         ret = CKR_GENERAL_ERROR;
-        P11PROV_raise(ctx->provctx, ret, "No matching object stored");
-        goto done;
-    }
-
-    if (p11prov_obj_get_class(ctx->object) != CKO_PRIVATE_KEY) {
-        ret = CKR_ARGUMENTS_BAD;
-        P11PROV_raise(ctx->provctx, ret,
-                      "Referenced object is not a private key");
+        P11PROV_debug("No matching object stored");
         goto done;
     }
 
@@ -174,185 +228,166 @@ done:
     return ret;
 }
 
-static int
-p11prov_decoder_decode_p11pkey(CK_KEY_TYPE desired_key_type, void *inctx,
-                               OSSL_CORE_BIO *cin, int selection,
-                               OSSL_CALLBACK *object_cb, void *object_cbarg,
-                               OSSL_PASSPHRASE_CALLBACK *pw_cb, void *pw_cbarg)
+static int obj_desc_verify(P11PROV_PK11_URI *obj)
 {
-    P11PROV_DECODER_CTX *ctx = inctx;
-    P11PROV_PK11_URI *key = NULL;
-    BIO *bin;
-    int ret = 0;
-    const char *uri = NULL;
-
-    P11PROV_debug("P11 KEY DECODER DECODE (selection:0x%x)", selection);
-    if ((bin = BIO_new_from_core_bio(p11prov_ctx_get_libctx(ctx->provctx), cin))
-        == NULL) {
-        P11PROV_debug("P11 KEY DECODER BIO_new_from_core_bio failed");
-        goto done;
+    const char *desc = NULL;
+    int desc_len;
+    desc = (const char *)ASN1_STRING_get0_data(obj->desc);
+    desc_len = ASN1_STRING_length(obj->desc);
+    if (!desc || desc_len <= 0) {
+        P11PROV_debug("Failed to get description");
+        return RET_OSSL_ERR;
     }
 
-    const char *data_type = NULL;
-    switch (desired_key_type) {
-    case CKK_RSA:
-        data_type = P11PROV_NAME_RSA;
-        break;
-    case CKK_EC:
-        data_type = P11PROV_NAME_EC;
-        break;
-    default:
-        ret = 0;
-        P11PROV_raise(ctx->provctx, CKR_ARGUMENTS_BAD, "Unsupported key type");
+    if (desc_len != (sizeof(P11PROV_DESCS_URI_FILE) - 1)
+        || 0 != strncmp(desc, P11PROV_DESCS_URI_FILE, desc_len)) {
+        P11PROV_debug("Description string does not match");
+        return RET_OSSL_ERR;
+    }
+    return RET_OSSL_OK;
+}
+
+static int p11prov_der_decoder_p11prov_obj_decode(
+    const char *desired_data_type, void *inctx, OSSL_CORE_BIO *cin,
+    int selection, OSSL_CALLBACK *object_cb, void *object_cbarg,
+    OSSL_PASSPHRASE_CALLBACK *pw_cb, void *pw_cbarg)
+{
+    P11PROV_DECODER_CTX *const ctx = inctx;
+    P11PROV_PK11_URI *obj = NULL;
+    BIO *bin;
+    int ret = RET_OSSL_CARRY_ON_DECODING;
+    const char *uri = NULL;
+    int uri_len;
+
+    bin = BIO_new_from_core_bio(p11prov_ctx_get_libctx(ctx->provctx), cin);
+    if (!bin) {
+        P11PROV_debug("P11 DECODER BIO_new_from_core_bio failed");
         goto done;
     }
 
     const unsigned char *der;
     long der_len = BIO_get_mem_data(bin, &der);
     if (der_len <= 0) {
-        P11PROV_debug("P11 KEY DECODER BIO_get_mem_data failed");
-        ret = 1;
+        P11PROV_debug("P11 DECODER BIO_get_mem_data failed");
         goto done;
     }
-    if ((key = d2i_P11PROV_PK11_URI(NULL, &der, der_len)) == NULL) {
+    obj = d2i_P11PROV_PK11_URI(NULL, &der, der_len);
+    if (!obj) {
         P11PROV_debug("P11 KEY DECODER d2i_P11PROV_PK11_URI failed");
-        ret = 1;
         goto done;
     }
 
-    char oid_txt[MAX_OID_LEN];
-    if (OBJ_obj2txt(oid_txt, sizeof(oid_txt), key->type, 1) > 0) {
-        P11PROV_debug("P11 KEY DECODER got OID %s", oid_txt);
-    } else {
-        P11PROV_debug("P11 KEY DECODER OBJ_obj2txt failed");
+    if (!obj_desc_verify(obj)) {
         goto done;
     }
 
-    uri = (const char *)ASN1_STRING_get0_data(key->uri);
-    if (uri == NULL) {
-        P11PROV_raise(ctx->provctx, CKR_GENERAL_ERROR, "Failed to get URI");
+    uri = (const char *)ASN1_STRING_get0_data(obj->uri);
+    uri_len = ASN1_STRING_length(obj->uri);
+    /* todo check string ends in \0 */
+    if (!uri || uri_len <= 0) {
+        P11PROV_debug("Failed to get URI");
         goto done;
     }
 
-    if (p11prov_decoder_load_pkey(ctx, uri, pw_cb, pw_cbarg) != CKR_OK) {
-        P11PROV_debug("P11 KEY DECODER p11prov_decoder_load_key failed");
+    if (p11prov_decoder_load_obj(ctx, uri, pw_cb, pw_cbarg) != CKR_OK) {
         goto done;
     }
 
-    if (p11prov_obj_get_key_type(ctx->object) != desired_key_type) {
-        P11PROV_debug(
-            "P11 KEY DECODER p11prov_decoder_load_key wrong key type");
-        ret = 1;
-        goto done;
-    }
-
-    P11PROV_debug("P11 KEY DECODER p11prov_decoder_load_key OK");
-
-    void *key_reference = NULL;
-    size_t key_reference_sz = 0;
-    p11prov_obj_to_store_reference(ctx->object, &key_reference,
-                                   &key_reference_sz);
-
-    int object_type = OSSL_OBJECT_PKEY;
     OSSL_PARAM params[4];
-    params[0] = OSSL_PARAM_construct_int(OSSL_OBJECT_PARAM_TYPE, &object_type);
-    params[1] = OSSL_PARAM_construct_utf8_string(OSSL_OBJECT_PARAM_DATA_TYPE,
-                                                 (char *)data_type, 0);
-    /* The address of the key becomes the octet string */
-    params[2] = OSSL_PARAM_construct_octet_string(
-        OSSL_OBJECT_PARAM_REFERENCE, key_reference, key_reference_sz);
-    params[3] = OSSL_PARAM_construct_end();
-    object_cb(params, object_cbarg);
+    if (!p11prov_obj_to_ossl_obj(ctx->object, params)) {
+        P11PROV_debug("Failed to turn p11prov obj into an OSSL_OBJECT");
+        goto done;
+    };
+
+    if (0 == strcmp(params[1].key, "data-type")
+        && 0 == strcmp(params[1].data, desired_data_type)) {
+        ret = object_cb(params, object_cbarg);
+    }
 
 done:
     decoder_ctx_object_free(ctx);
-    P11PROV_PK11_URI_free(key);
+    P11PROV_PK11_URI_free(obj);
     BIO_free(bin);
-    P11PROV_debug("P11 KEY DECODER RESULT=%d", ret);
+    P11PROV_debug("der decoder (cary on:%d)", ret);
     return ret;
 }
 
-static int p11prov_der_decoder_p11_rsa_decode(
+static int p11prov_der_decoder_p11prov_rsa_decode(
     void *inctx, OSSL_CORE_BIO *cin, int selection, OSSL_CALLBACK *object_cb,
     void *object_cbarg, OSSL_PASSPHRASE_CALLBACK *pw_cb, void *pw_cbarg)
 {
-    return p11prov_decoder_decode_p11pkey(CKK_RSA, inctx, cin, selection,
-                                          object_cb, object_cbarg, pw_cb,
-                                          pw_cbarg);
+    return p11prov_der_decoder_p11prov_obj_decode(
+        P11PROV_NAME_RSA, inctx, cin, selection, object_cb, object_cbarg, pw_cb,
+        pw_cbarg);
 }
 
-const OSSL_DISPATCH p11prov_der_decoder_p11_rsa_functions[] = {
+const OSSL_DISPATCH p11prov_der_decoder_p11prov_rsa_functions[] = {
     DISPATCH_BASE_DECODER_ELEM(NEWCTX, newctx),
     DISPATCH_BASE_DECODER_ELEM(FREECTX, freectx),
-    DISPATCH_DECODER_ELEM(DECODE, der, p11, rsa, decode),
+    DISPATCH_DECODER_ELEM(DECODE, der, p11prov, rsa, decode),
     { 0, NULL }
 };
 
-static int p11prov_der_decoder_p11_ec_decode(
+static int p11prov_der_decoder_p11prov_ec_decode(
     void *inctx, OSSL_CORE_BIO *cin, int selection, OSSL_CALLBACK *object_cb,
     void *object_cbarg, OSSL_PASSPHRASE_CALLBACK *pw_cb, void *pw_cbarg)
 {
-    return p11prov_decoder_decode_p11pkey(CKK_EC, inctx, cin, selection,
-                                          object_cb, object_cbarg, pw_cb,
-                                          pw_cbarg);
+    return p11prov_der_decoder_p11prov_obj_decode(
+        P11PROV_NAME_EC, inctx, cin, selection, object_cb, object_cbarg, pw_cb,
+        pw_cbarg);
 }
 
-const OSSL_DISPATCH p11prov_der_decoder_p11_ec_functions[] = {
+const OSSL_DISPATCH p11prov_der_decoder_p11prov_ec_functions[] = {
     DISPATCH_BASE_DECODER_ELEM(NEWCTX, newctx),
     DISPATCH_BASE_DECODER_ELEM(FREECTX, freectx),
-    DISPATCH_DECODER_ELEM(DECODE, der, p11, ec, decode),
+    DISPATCH_DECODER_ELEM(DECODE, der, p11prov, ec, decode),
     { 0, NULL }
 };
 
-static int p11prov_pem_decoder_p11_der_decode(
+static int p11prov_pem_decoder_p11prov_der_decode(
     void *inctx, OSSL_CORE_BIO *cin, int selection, OSSL_CALLBACK *object_cb,
     void *object_cbarg, OSSL_PASSPHRASE_CALLBACK *pw_cb, void *pw_cbarg)
 {
 
     BIO *bin;
-    char *pem_name;
+    char *pem_label;
     char *pem_header;
     unsigned char *der_data;
     long der_len;
     OSSL_PARAM params[3];
-    int ret;
+    int ret = RET_OSSL_CARRY_ON_DECODING;
     P11PROV_DECODER_CTX *ctx = inctx;
 
-    P11PROV_debug("DER DECODER DECODE (selection:0x%x)", selection);
-
-    if ((bin = BIO_new_from_core_bio(p11prov_ctx_get_libctx(ctx->provctx), cin))
-        == NULL) {
+    bin = BIO_new_from_core_bio(p11prov_ctx_get_libctx(ctx->provctx), cin);
+    if (!bin) {
         P11PROV_debug("BIO_new_from_core_bio failed");
-        return 0;
+        return RET_OSSL_CARRY_ON_DECODING;
     }
-    P11PROV_debug("DER DECODER PEM_read_pio (fpos:%u)", BIO_tell(bin));
 
-    if (PEM_read_bio(bin, &pem_name, &pem_header, &der_data, &der_len) > 0
-        && strcmp(pem_name, P11PROV_PRIVKEY_PEM_NAME) == 0) {
+    P11PROV_debug("PEM_read_pio (fpos:%u)", BIO_tell(bin));
+
+    if (PEM_read_bio(bin, &pem_label, &pem_header, &der_data, &der_len) > 0
+        && strcmp(pem_label, P11PROV_PEM_LABEL) == 0) {
         params[0] = OSSL_PARAM_construct_octet_string(OSSL_OBJECT_PARAM_DATA,
                                                       der_data, der_len);
         params[1] = OSSL_PARAM_construct_utf8_string(
-            OSSL_OBJECT_PARAM_DATA_STRUCTURE,
-            (char *)P11PROV_PK11_URI_STRUCTURE, 0);
+            OSSL_OBJECT_PARAM_DATA_STRUCTURE, (char *)P11PROV_DER_STRUCTURE, 0);
         params[2] = OSSL_PARAM_construct_end();
         ret = object_cb(params, object_cbarg);
-    } else {
-        /* We return "empty handed". This is not an error. */
-        ret = 1;
     }
 
-    OPENSSL_free(pem_name);
+    OPENSSL_free(pem_label);
     OPENSSL_free(pem_header);
     OPENSSL_free(der_data);
     BIO_free(bin);
 
-    P11PROV_debug("DER DECODER RESULT=%d", ret);
+    P11PROV_debug("pem decoder (carry on:%d)", ret);
     return ret;
 }
 
-const OSSL_DISPATCH p11prov_pem_decoder_p11_der_functions[] = {
+const OSSL_DISPATCH p11prov_pem_decoder_p11prov_der_functions[] = {
     DISPATCH_BASE_DECODER_ELEM(NEWCTX, newctx),
     DISPATCH_BASE_DECODER_ELEM(FREECTX, freectx),
-    DISPATCH_DECODER_ELEM(DECODE, pem, p11, der, decode),
+    DISPATCH_DECODER_ELEM(DECODE, pem, p11prov, der, decode),
     { 0, NULL }
 };
