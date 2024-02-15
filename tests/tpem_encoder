@@ -17,8 +17,8 @@ make-uri-pem() {
     OUT=$2
     DESC="${3:-PKCS#11 Provider URI v1.0}"
 
-    DESC_HEX=$(printf '%s' "${DESC}" | perl -ne 'print unpack "H*", $_')
-    URI_HEX=$(printf '%s' "${URI}" | perl -ne 'print unpack "H*", $_')
+    DESC_HEX=$(printf '%s' "${DESC}" | od -An -t x1)
+    URI_HEX=$(printf '%s' "${URI}"   | od -An -t x1)
     {
         echo "-----BEGIN PKCS#11 PROVIDER URI-----"
         printf '30 82 %04x 1a 82 %04x %s 0c 82 %04x %s'  \
@@ -27,8 +27,9 @@ make-uri-pem() {
                "${DESC_HEX[*]}" \
                "${#URI}" \
                "${URI_HEX[*]}" \
-            | tr -d ' ' \
-	    | perl -ne 'print pack "H*", $_' \
+	    | tr -d '\r\n\t ' \
+	    | sed -e 's,\(.\{2\}\),\\x\1,g' \
+	    | xargs -0 printf \
 	    | base64
         echo "-----END PKCS#11 PROVIDER URI-----"
     }  > "${OUT}"
