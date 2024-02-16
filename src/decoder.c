@@ -12,220 +12,37 @@
 #include <openssl/store.h>
 #include <openssl/ui.h>
 
-#define MIN(a, b) (((a) < (b)) ? (a) : (b))
-
 typedef struct p11prov_decoder_ctx {
     P11PROV_CTX *provctx;
-    P11PROV_OBJ *object;
-    bool invalid;
 } P11PROV_DECODER_CTX;
-
-static int p11prov_obj_to_ossl_obj(P11PROV_OBJ *obj, OSSL_PARAM params[4])
-{
-    int object_type;
-    const char *data_type;
-    void *reference = NULL;
-    size_t reference_len;
-    CK_KEY_TYPE type;
-    CK_ATTRIBUTE *cert = NULL;
-    switch (p11prov_obj_get_class(obj)) {
-    case CKO_PUBLIC_KEY:
-    case CKO_PRIVATE_KEY:
-        object_type = OSSL_OBJECT_PKEY;
-        type = p11prov_obj_get_key_type(obj);
-        switch (type) {
-        case CKK_RSA:
-            data_type = P11PROV_NAME_RSA;
-            break;
-        case CKK_EC:
-            data_type = P11PROV_NAME_EC;
-            break;
-        case CKK_EC_EDWARDS:
-            switch (p11prov_obj_get_key_bit_size(obj)) {
-            case ED448_BIT_SIZE:
-                data_type = ED448;
-                break;
-            case ED25519_BIT_SIZE:
-                data_type = ED25519;
-                break;
-            default:
-                return RET_OSSL_ERR;
-            }
-            break;
-        default:
-            return RET_OSSL_ERR;
-        }
-        p11prov_obj_to_store_reference(obj, &reference, &reference_len);
-        if (!reference) {
-            return RET_OSSL_ERR;
-        }
-        break;
-    case CKO_CERTIFICATE:
-        object_type = OSSL_OBJECT_CERT;
-        data_type = "CERTIFICATE";
-        cert = p11prov_obj_get_attr(obj, CKA_VALUE);
-        if (!cert) {
-            return RET_OSSL_ERR;
-        }
-        break;
-    default:
-        return RET_OSSL_ERR;
-    }
-
-    params[0] = OSSL_PARAM_construct_int(OSSL_OBJECT_PARAM_TYPE, &object_type);
-    params[1] = OSSL_PARAM_construct_utf8_string(OSSL_OBJECT_PARAM_DATA_TYPE,
-                                                 (char *)data_type, 0);
-    if (reference) {
-        /* giving away the object by reference */
-        params[2] = OSSL_PARAM_construct_octet_string(
-            OSSL_OBJECT_PARAM_REFERENCE, reference, reference_len);
-    } else if (cert) {
-        params[2] = OSSL_PARAM_construct_octet_string(
-            OSSL_OBJECT_PARAM_DATA, cert->pValue, cert->ulValueLen);
-    } else {
-        return RET_OSSL_ERR;
-    }
-    params[3] = OSSL_PARAM_construct_end();
-    return RET_OSSL_OK;
-}
-
-static bool decoder_ctx_accepts_decoded_object(P11PROV_DECODER_CTX *ctx)
-{
-    return (!ctx->invalid) && (!ctx->object);
-}
-
-static void decoder_ctx_object_free(struct p11prov_decoder_ctx *ctx)
-{
-    if (ctx && ctx->object) {
-        p11prov_obj_free(ctx->object);
-        ctx->object = NULL;
-    }
-}
 
 static void *p11prov_decoder_newctx(void *provctx)
 {
-    P11PROV_CTX *cprov;
     P11PROV_DECODER_CTX *dctx;
-    cprov = provctx;
     dctx = OPENSSL_zalloc(sizeof(P11PROV_DECODER_CTX));
     if (!dctx) {
         return NULL;
     }
 
-    dctx->provctx = cprov;
+    dctx->provctx = provctx;
     return dctx;
 }
 
-static void p11prov_decoder_freectx(void *inctx)
+static void p11prov_decoder_freectx(void *ctx)
 {
-    P11PROV_DECODER_CTX *ctx = inctx;
-
-    decoder_ctx_object_free(ctx);
     OPENSSL_clear_free(ctx, sizeof(P11PROV_DECODER_CTX));
 }
 
-static CK_RV p11prov_decoder_ctx_store_obj(void *pctx, P11PROV_OBJ *obj)
+struct desired_type_match_data {
+    const char *desired_type;
+    bool matches;
+};
+
+static void desired_type_accumulate_matches(const char *name, void *data)
 {
-    P11PROV_DECODER_CTX *ctx = pctx;
-
-    if (!decoder_ctx_accepts_decoded_object(ctx)) {
-        P11PROV_raise(ctx->provctx, CKR_GENERAL_ERROR,
-                      "decoder context does not accept any objects");
-        ctx->invalid = 1;
-        decoder_ctx_object_free(ctx);
-        p11prov_obj_free(obj);
-        return CKR_GENERAL_ERROR;
-    }
-
-    P11PROV_debug("Adding object (handle:%lu)", p11prov_obj_get_handle(obj));
-    ctx->object = obj;
-
-    return CKR_OK;
-}
-
-static CK_RV p11prov_decoder_load_obj(P11PROV_DECODER_CTX *ctx,
-                                      const char *inuri,
-                                      OSSL_PASSPHRASE_CALLBACK *pw_cb,
-                                      void *pw_cbarg)
-{
-    P11PROV_URI *parsed_uri = NULL;
-    CK_RV ret = CKR_GENERAL_ERROR;
-    P11PROV_SESSION *session = NULL;
-    CK_SLOT_ID slotid = CK_UNAVAILABLE_INFORMATION;
-    CK_SLOT_ID nextid = CK_UNAVAILABLE_INFORMATION;
-
-    if (!decoder_ctx_accepts_decoded_object(ctx)) {
-        P11PROV_debug("Invalid initial state");
-        goto done;
-    }
-
-    parsed_uri = p11prov_parse_uri(ctx->provctx, inuri);
-    if (!parsed_uri) {
-        P11PROV_debug("Failed to parse URI");
-        goto done;
-    }
-
-    ret = p11prov_ctx_status(ctx->provctx);
-    if (ret != CKR_OK) {
-        P11PROV_debug("Invalid context status");
-        goto done;
-    }
-
-    p11prov_set_error_mark(ctx->provctx);
-    do {
-        nextid = CK_UNAVAILABLE_INFORMATION;
-        p11prov_return_session(session);
-        if (!decoder_ctx_accepts_decoded_object(ctx)) {
-            break;
-        }
-
-        ret = p11prov_get_session(ctx->provctx, &slotid, &nextid, parsed_uri,
-                                  CK_UNAVAILABLE_INFORMATION, pw_cb, pw_cbarg,
-                                  true, false, &session);
-        if (ret != CKR_OK) {
-            P11PROV_debug(
-                "Failed to get session to load keys (slotid=%lx, ret=%lx)",
-                slotid, ret);
-            slotid = nextid;
-            continue;
-        }
-
-        ret = p11prov_obj_find(ctx->provctx, session, slotid, parsed_uri,
-                               p11prov_decoder_ctx_store_obj, ctx);
-        if (ret != CKR_OK) {
-            P11PROV_debug(
-                "Failed to find object on (slotid=%lx, session=%lx, ret=%lx)",
-                slotid, session, ret);
-            slotid = nextid;
-            continue;
-        }
-        slotid = nextid;
-    } while (nextid != CK_UNAVAILABLE_INFORMATION);
-    ret = CKR_OK;
-    p11prov_pop_error_to_mark(ctx->provctx);
-    p11prov_clear_last_error_mark(ctx->provctx);
-
-    if (ctx->invalid) {
-        ret = CKR_GENERAL_ERROR;
-        P11PROV_debug("Invalid context status");
-        goto done;
-    }
-
-    if (!ctx->object) {
-        ret = CKR_GENERAL_ERROR;
-        P11PROV_debug("No matching object stored");
-        goto done;
-    }
-
-done:
-    p11prov_uri_free(parsed_uri);
-    p11prov_return_session(session);
-    if (ret != CKR_OK) {
-        decoder_ctx_object_free(ctx);
-    }
-
-    P11PROV_debug("Done (result:%d)", ret);
-    return ret;
+    struct desired_type_match_data *type_match = data;
+    P11PROV_debug("'%s' ?= '%s'", name ,type_match->desired_type);
+    type_match->matches |= 0 == OPENSSL_strcasecmp(name, type_match->desired_type);
 }
 
 static int obj_desc_verify(P11PROV_PK11_URI *obj)
@@ -247,6 +64,82 @@ static int obj_desc_verify(P11PROV_PK11_URI *obj)
     return RET_OSSL_OK;
 }
 
+static char *obj_uri_get1(P11PROV_PK11_URI *obj)
+{
+    const unsigned char *uri = ASN1_STRING_get0_data(obj->uri);
+    int uri_len = ASN1_STRING_length(obj->uri);
+    if (!uri || uri_len <= 0) {
+        P11PROV_debug("Failed to get URI");
+        return NULL;
+    }
+    char *null_terminated_uri = OPENSSL_zalloc(uri_len + 1);
+    if (!null_terminated_uri) {
+        return NULL;
+    }
+    memcpy(null_terminated_uri, uri, uri_len);
+    return null_terminated_uri;
+}
+
+static int ui_open(UI *ui)
+{
+    return 1;
+}
+
+static int ui_write(UI *ui, UI_STRING *uis)
+{
+    return 1;
+}
+
+static int ui_close(UI *ui)
+{
+    return 1;
+}
+
+struct pw_cb_data {
+    OSSL_PASSPHRASE_CALLBACK *cb;
+    void *cbarg;
+};
+
+static int ui_read(UI *ui, UI_STRING *uis)
+{
+    switch (UI_get_string_type(uis)) {
+    case UIT_PROMPT: {
+        const int bufsize = 1024;
+        char result[bufsize + 1];
+        struct pw_cb_data *pw = UI_get0_user_data(ui);
+        int maxsize = UI_get_result_maxsize(uis);
+        size_t len;
+        if (pw->cb(result, maxsize > bufsize ? bufsize : maxsize, &len, NULL,
+                   pw->cbarg)) {
+            if (len >= 0) result[len] = '\0';
+            if (UI_set_result_ex(ui, uis, result, len) >= 0) return 1;
+            return 0;
+        }
+    }
+    case UIT_VERIFY:
+    case UIT_NONE:
+    case UIT_BOOLEAN:
+    case UIT_INFO:
+    case UIT_ERROR:
+        break;
+    }
+    return 1;
+}
+
+static UI_METHOD *wrap_passphrase_callback(OSSL_PASSPHRASE_CALLBACK *pw_cb)
+{
+    UI_METHOD *ui_method = UI_create_method("OSSL_PASSPHRASE_CALLBACK wrapper");
+
+    if (!ui_method || UI_method_set_opener(ui_method, ui_open) < 0
+        || UI_method_set_reader(ui_method, ui_read) < 0
+        || UI_method_set_writer(ui_method, ui_write) < 0
+        || UI_method_set_closer(ui_method, ui_close) < 0) {
+        UI_destroy_method(ui_method);
+        return NULL;
+    }
+    return ui_method;
+}
+
 static int p11prov_der_decoder_p11prov_obj_decode(
     const char *desired_data_type, void *inctx, OSSL_CORE_BIO *cin,
     int selection, OSSL_CALLBACK *object_cb, void *object_cbarg,
@@ -256,8 +149,8 @@ static int p11prov_der_decoder_p11prov_obj_decode(
     P11PROV_PK11_URI *obj = NULL;
     BIO *bin;
     int ret = RET_OSSL_CARRY_ON_DECODING;
-    const char *uri = NULL;
-    int uri_len;
+    char *uri = NULL;
+    OSSL_STORE_CTX *store_ctx = NULL;
 
     bin = BIO_new_from_core_bio(p11prov_ctx_get_libctx(ctx->provctx), cin);
     if (!bin) {
@@ -281,31 +174,77 @@ static int p11prov_der_decoder_p11prov_obj_decode(
         goto done;
     }
 
-    uri = (const char *)ASN1_STRING_get0_data(obj->uri);
-    uri_len = ASN1_STRING_length(obj->uri);
-    /* todo check string ends in \0 */
-    if (!uri || uri_len <= 0) {
-        P11PROV_debug("Failed to get URI");
+    uri = obj_uri_get1(obj);
+    if (!uri) {
         goto done;
     }
 
-    if (p11prov_decoder_load_obj(ctx, uri, pw_cb, pw_cbarg) != CKR_OK) {
+    p11prov_set_error_mark(ctx->provctx);
+
+    UI_METHOD *ui_method = wrap_passphrase_callback(pw_cb);
+    struct pw_cb_data pw = { pw_cb, pw_cbarg };
+    if ((store_ctx = OSSL_STORE_open_ex(uri, NULL, NULL, ui_method, &pw, NULL,
+                                        NULL, NULL))
+        == NULL) {
+        P11PROV_debug("Couldn't open file or uri %s\n", uri);
         goto done;
     }
 
-    OSSL_PARAM params[4];
-    if (!p11prov_obj_to_ossl_obj(ctx->object, params)) {
-        P11PROV_debug("Failed to turn p11prov obj into an OSSL_OBJECT");
-        goto done;
-    };
+    for (;;) {
+        OSSL_STORE_INFO *info = OSSL_STORE_load(store_ctx);
+        int type = info == NULL ? 0 : OSSL_STORE_INFO_get_type(info);
 
-    if (0 == strcmp(params[1].key, "data-type")
-        && 0 == strcmp(params[1].data, desired_data_type)) {
-        ret = object_cb(params, object_cbarg);
+        if (!info) {
+            if (OSSL_STORE_eof(store_ctx)) {
+                break;
+            }
+            if (OSSL_STORE_error(store_ctx)) {
+                continue;
+            }
+            break;
+        }
+
+        EVP_PKEY *pkey = NULL;
+        switch (type) {
+        case OSSL_STORE_INFO_PARAMS:
+            P11PROV_debug("OSSL_STORE_INFO_PARAMS");
+            pkey = OSSL_STORE_INFO_get0_PARAMS(info);
+            break;
+        case OSSL_STORE_INFO_PUBKEY:
+            P11PROV_debug("OSSL_STORE_INFO_PUBKEY");
+            pkey = OSSL_STORE_INFO_get0_PUBKEY(info);
+            break;
+        case OSSL_STORE_INFO_PKEY:
+            P11PROV_debug("OSSL_STORE_INFO_PKEY");
+            pkey = OSSL_STORE_INFO_get0_PKEY(info);
+            break;
+        }
+        if (pkey) {
+            struct desired_type_match_data type_match_data = { 0 };
+            type_match_data.desired_type = desired_data_type;
+            EVP_PKEY_type_names_do_all(pkey, desired_type_accumulate_matches,
+                                       &type_match_data);
+            if (type_match_data.matches) {
+                OSSL_PARAM *params = NULL;
+                if (EVP_PKEY_todata(pkey, 0, &params)) {
+                    ret = object_cb(params, object_cbarg);
+                }
+                OSSL_PARAM_free(params);
+            } else {
+                P11PROV_debug("NO type match");
+            }
+        } else {
+            P11PROV_debug("NO pkey");
+        }
+        OSSL_STORE_INFO_free(info);
     }
+
+    p11prov_pop_error_to_mark(ctx->provctx);
+    p11prov_clear_last_error_mark(ctx->provctx);
 
 done:
-    decoder_ctx_object_free(ctx);
+    OSSL_STORE_close(store_ctx);
+    OPENSSL_free(uri);
     P11PROV_PK11_URI_free(obj);
     BIO_free(bin);
     P11PROV_debug("der decoder (cary on:%d)", ret);
